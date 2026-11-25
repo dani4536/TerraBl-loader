@@ -1,0 +1,109 @@
+name: Build TerraBL Loader (ARM32)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Acepta dos disposiciones del repo: proyecto descomprimido, o solo un .zip en la raiz.
+      - name: Localizar proyecto
+        id: p
+        run: |
+          if [ -f settings.gradle.kts ]; then
+            d=.
+          else
+            z=$(ls -1 *.zip 2>/dev/null | head -1 || true)
+            [ -n "$z" ] || { echo "::error::No hay settings.gradle.kts ni un .zip en la raiz del repositorio"; exit 1; }
+            unzip -q -o "$z" -d _src
+            s=$(find _src -name settings.gradle.kts | head -1)
+            [ -n "$s" ] || { echo "::error::El .zip no contiene settings.gradle.kts"; exit 1; }
+            d=$(dirname "$s")
+          fi
+          echo "Proyecto en: $d"
+          echo "dir=$d" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar plataforma, NDK y CMake
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Preflight (configuracion; no es una compilacion)
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: python3 tools/preflight.py
+
+      - name: Compilar APK debug y release (armeabi-v7a)
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: gradle :app:assembleDebug :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verificar ABI (solo armeabi-v7a, ELF ARM 32 bits)
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: |
+          set -e
+          for apk in app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk; do
+            echo "== $apk"
+            libs=$(unzip -Z1 "$apk" | grep '^lib/' | grep -v '/$' || true)
+            echo "$libs"
+            echo "$libs" | grep -qx 'lib/armeabi-v7a/libterrabl.so' || { echo "::error::falta libterrabl.so ARM32 en $apk"; exit 1; }
+            if echo "$libs" | grep -v '^lib/armeabi-v7a/' | grep -q .; then echo "::error::hay bibliotecas de otra ABI en $apk"; exit 1; fi
+            rm -rf /tmp/x && mkdir -p /tmp/x && unzip -q "$apk" 'lib/armeabi-v7a/*.so' -d /tmp/x
+            for so in /tmp/x/lib/armeabi-v7a/*.so; do
+              out=$(file "$so"); echo "$out"
+              echo "$out" | grep -q 'ELF 32-bit' && echo "$out" | grep -q 'ARM' || { echo "::error::$so no es ELF ARM 32 bits"; exit 1; }
+            done
+          done
+
+      - name: Reunir APKs
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/*.apk   dist/TerraBL-Loader-debug-armeabi-v7a.apk
+          cp app/build/outputs/apk/release/*.apk dist/TerraBL-Loader-release-armeabi-v7a.apk
+          (cd dist && sha256sum *.apk | tee SHA256SUMS.txt)
+
+      - name: Publicar artefacto descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: TerraBL-Loader-APK-armeabi-v7a
+          path: ${{ steps.p.outputs.dir }}/dist/*
+          if-no-files-found: error
+
+      # Enlace directo al .apk (sin ZIP) en la pestana Releases: mas comodo desde el movil.
+      - name: Publicar en Releases (APK directo)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" ${{ steps.p.outputs.dir }}/dist/*.apk \
+            --target "${{ github.sha }}" --prerelease \
+            --title "TerraBL Loader build ${{ github.run_number }} (armeabi-v7a, SIN PROBAR)" \
+            --notes "APK ARM32 compilado por GitHub Actions. No probado en dispositivo. Solo gestor de paquetes .bl; no inyecta mods en Terraria."
+
+      # Informativo: el codigo nunca se ha ejecutado, un test fallido no debe impedir tener el APK.
+      - name: Tests unitarios JVM (informativo)
+        continue-on-error: true
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: gradle :app:testDebugUnitTest --no-daemon
